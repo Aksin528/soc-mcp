@@ -1,6 +1,7 @@
 """Splunk tools for SOC MCP server."""
 
 import os
+import re
 import httpx
 
 
@@ -14,6 +15,25 @@ def _client() -> httpx.AsyncClient:
 
 def _headers() -> dict:
     return {"Authorization": f"Bearer {SPLUNK_TOKEN}"}
+
+
+def _normalize_earliest(value: str) -> str:
+    """Normalize relative time strings to Splunk's "-N<unit>" format.
+
+    Models frequently omit the leading "-" (e.g. "30m") or use Splunk's raw SPL
+    syntax (e.g. "now-30m"). Both mean the same thing here, so fix them up
+    instead of erroring. Absolute timestamps and "now" pass through unchanged.
+    """
+    if not value:
+        return value
+    v = value.strip()
+    if v == "now" or v.startswith("-"):
+        return v
+    if v.startswith("now-"):
+        return "-" + v[len("now-"):]
+    if re.fullmatch(r"\d+[smhdwMy]", v):
+        return "-" + v
+    return v
 
 
 def _handle_response(resp: httpx.Response) -> dict:
@@ -73,6 +93,7 @@ def register_splunk_tools(mcp):
         Example: search index=main EventCode=4625 | head 50"""
         if not query.strip().startswith("search "):
             query = "search " + query
+        earliest = _normalize_earliest(earliest)
         async with _client() as client:
             resp = await client.post(
                 f"{SPLUNK_BASE_URL}/services/search/jobs",
@@ -98,6 +119,7 @@ def register_splunk_tools(mcp):
         """Get Splunk ES Incident Review notable events with full enriched data
         (owner, status, disposition, drilldown searches, MITRE ATT&CK, risk scores).
         Severity options: informational, low, medium, high, critical, all (default: all)"""
+        earliest = _normalize_earliest(earliest)
         query = f"search `get_notable_index` earliest={earliest} {_ES_NOTABLE_ENRICHMENT}"
         if severity != "all":
             query += f" | search severity={severity}"
@@ -150,6 +172,7 @@ def register_splunk_tools(mcp):
         limit: int = 100,
     ) -> dict:
         """Search all Splunk events related to a specific IP address."""
+        earliest = _normalize_earliest(earliest)
         query = f"search (src_ip={ip} OR dest_ip={ip} OR src={ip} OR dest={ip}) earliest={earliest} | head {limit}"
         async with _client() as client:
             resp = await client.post(
@@ -171,6 +194,7 @@ def register_splunk_tools(mcp):
         limit: int = 100,
     ) -> dict:
         """Search all Splunk events related to a specific username."""
+        earliest = _normalize_earliest(earliest)
         query = f"search (user={username} OR src_user={username} OR User={username}) earliest={earliest} | head {limit}"
         async with _client() as client:
             resp = await client.post(
