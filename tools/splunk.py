@@ -16,6 +16,50 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {SPLUNK_TOKEN}"}
 
 
+def _handle_response(resp: httpx.Response) -> dict:
+    """Raise with Splunk's own diagnostic message attached, instead of a generic httpx error."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = resp.json().get("messages", resp.text)
+        except Exception:
+            detail = resp.text
+        raise httpx.HTTPStatusError(
+            f"{e}\nSplunk response: {detail}", request=e.request, response=e.response
+        ) from None
+    return resp.json()
+
+
+# Full Splunk ES "Incident Review - Main" enrichment pipeline (from savedsearches.conf),
+# with the dashboard's $token$ filter placeholders removed since they're blank by default.
+# Requires the SplunkEnterpriseSecuritySuite app namespace to resolve these macros.
+_ES_NOTABLE_ENRICHMENT = (
+    "| eval `get_event_id_meval`,rule_id=event_id "
+    "| dedup rule_id "
+    "| fields - host_* "
+    "| tags outputfield=tag "
+    "| `mvappend_field(tag,orig_tag)` "
+    "| `notable_xref_lookup` "
+    "| `get_correlations_performant` "
+    "| `get_current_status` "
+    "| `get_owner` "
+    "| `get_urgency` "
+    "| typer "
+    "| tags outputfield=tag "
+    "| `mvappend_field(tag,orig_tag)` "
+    "| `suppression_extract` "
+    "| search NOT suppression=* "
+    "| `risk_correlation` "
+    "| `get_mitre_annotations` "
+    "| `get_notable_type` "
+    "| `get_orig_source` "
+    "| `add_normalized_risk_object`"
+)
+
+ES_APP_SEARCH_URL_TMPL = "{base}/servicesNS/nobody/SplunkEnterpriseSecuritySuite/search/jobs"
+
+
 def register_splunk_tools(mcp):
 
     @mcp.tool()
@@ -43,8 +87,7 @@ def register_splunk_tools(mcp):
                     "count": 0,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()
+            return _handle_response(resp)
 
     @mcp.tool()
     async def splunk_notable_events(
@@ -52,15 +95,16 @@ def register_splunk_tools(mcp):
         earliest: str = "-24h",
         limit: int = 10,
     ) -> dict:
-        """Get Splunk ES Incident Review notable events with full enriched data.
+        """Get Splunk ES Incident Review notable events with full enriched data
+        (owner, status, disposition, drilldown searches, MITRE ATT&CK, risk scores).
         Severity options: informational, low, medium, high, critical, all (default: all)"""
-        if severity == "all":
-            query = f"search index=notable earliest={earliest} | head {limit}"
-        else:
-            query = f"search index=notable earliest={earliest} severity={severity} | head {limit}"
+        query = f"search `get_notable_index` earliest={earliest} {_ES_NOTABLE_ENRICHMENT}"
+        if severity != "all":
+            query += f" | search severity={severity}"
+        query += f" | head {limit}"
         async with _client() as client:
             resp = await client.post(
-                f"{SPLUNK_BASE_URL}/services/search/jobs",
+                ES_APP_SEARCH_URL_TMPL.format(base=SPLUNK_BASE_URL),
                 headers=_headers(),
                 data={
                     "search": query,
@@ -69,8 +113,7 @@ def register_splunk_tools(mcp):
                     "count": 0,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()
+            return _handle_response(resp)
 
     @mcp.tool()
     async def splunk_list_indexes() -> dict:
@@ -81,8 +124,7 @@ def register_splunk_tools(mcp):
                 headers=_headers(),
                 params={"output_mode": "json", "count": 0},
             )
-            resp.raise_for_status()
-            return resp.json()
+            return _handle_response(resp)
 
     @mcp.tool()
     async def splunk_list_sourcetypes(index: str = "main") -> dict:
@@ -99,8 +141,7 @@ def register_splunk_tools(mcp):
                     "count": 0,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()
+            return _handle_response(resp)
 
     @mcp.tool()
     async def splunk_search_by_ip(
@@ -121,8 +162,7 @@ def register_splunk_tools(mcp):
                     "count": 0,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()
+            return _handle_response(resp)
 
     @mcp.tool()
     async def splunk_search_by_user(
@@ -143,5 +183,4 @@ def register_splunk_tools(mcp):
                     "count": 0,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()
+            return _handle_response(resp)
