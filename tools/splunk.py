@@ -36,6 +36,101 @@ def _normalize_earliest(value: str) -> str:
     return v
 
 
+# Fields kept in splunk_notable_events results. Notable events carry ~80 fields
+# each, many of them huge (drilldown_searches, full mitre_description, _raw) —
+# large enough that even a handful of events can blow past a small local model's
+# context window. Keep only what a SOC analyst summary actually needs.
+_NOTABLE_EVENT_ALLOWED_FIELDS = frozenset({
+    "_time",
+    "rule_title",
+    "rule_name",
+    "severity",
+    "urgency",
+    "status",
+    "status_label",
+    "status_group",
+    "disposition",
+    "disposition_label",
+    "owner",
+    "owner_realname",
+    "event_id",
+    "rule_id",
+    "index",
+    "sourcetype",
+    "security_domain",
+    "notable_type",
+    "risk_score",
+    "src_risk_score",
+    "dest_risk_score",
+    "user_risk_score",
+    "annotations.mitre_attack.mitre_tactic",
+    "annotations.mitre_attack.mitre_tactic_id",
+    "annotations.mitre_attack.mitre_technique",
+    "annotations.mitre_attack.mitre_technique_id",
+    "dest",
+    "src",
+    "user",
+    "host",
+    "dvc",
+})
+
+
+# Fields that Splunk ES's Incident Review dashboard substitutes as $token$
+# placeholders inside rule_title. The dashboard resolves these client-side;
+# raw search results (what this API returns) keep the literal "$dest$" text,
+# so we resolve them here using the event's own field values.
+_RULE_TITLE_TOKEN_FIELDS = ("dest", "src", "user", "dvc", "process_name", "host")
+
+
+def _resolve_rule_title(event: dict) -> str | None:
+    """Replace $field$ placeholders in rule_title with the event's real values."""
+    rule_title = event.get("rule_title")
+    if not isinstance(rule_title, str) or "$" not in rule_title:
+        return rule_title
+    for field in _RULE_TITLE_TOKEN_FIELDS:
+        token = f"${field}$"
+        if token in rule_title:
+            value = event.get(field)
+            if isinstance(value, str) and value:
+                rule_title = rule_title.replace(token, value)
+    return rule_title
+
+
+def _slim_notable_event(event: dict) -> dict:
+    """Drop heavy/unused fields from a notable event, keeping the analyst-facing ones."""
+    return {k: v for k, v in event.items() if k in _NOTABLE_EVENT_ALLOWED_FIELDS}
+
+
+def _resolve_notable_response(data: dict) -> dict:
+    """Resolve rule_title placeholders for every result row using the full raw event.
+
+    Must run before _slim_notable_event, since some substitution fields (e.g.
+    process_name) aren't in the analyst-facing allowed field set.
+    """
+    results = data.get("results")
+    if isinstance(results, list):
+        data = dict(data)
+        resolved = []
+        for ev in results:
+            if isinstance(ev, dict):
+                ev = dict(ev)
+                ev["rule_title"] = _resolve_rule_title(ev)
+            resolved.append(ev)
+        data["results"] = resolved
+    return data
+
+
+def _slim_notable_response(data: dict) -> dict:
+    """Apply _slim_notable_event to every result row in a Splunk search response."""
+    results = data.get("results")
+    if isinstance(results, list):
+        data = dict(data)
+        data["results"] = [
+            _slim_notable_event(ev) if isinstance(ev, dict) else ev for ev in results
+        ]
+    return data
+
+
 def _handle_response(resp: httpx.Response) -> dict:
     """Raise with Splunk's own diagnostic message attached, instead of a generic httpx error."""
     try:
@@ -115,9 +210,15 @@ def register_splunk_tools(mcp):
         severity: str = "all",
         earliest: str = "-24h",
         limit: int = 10,
+        full: bool = False,
     ) -> dict:
-        """Get Splunk ES Incident Review notable events with full enriched data
-        (owner, status, disposition, drilldown searches, MITRE ATT&CK, risk scores).
+        """Get Splunk ES Incident Review notable events with enriched data
+        (owner, status, disposition, MITRE ATT&CK, risk scores). By default the
+        response fields are trimmed to the analyst-relevant set to keep results
+        compact and avoid overflowing small models' context windows. Pass
+        full=true to get every field (drilldown_searches, full descriptions,
+        _raw, etc.) — used by automation/workflows that build case descriptions,
+        not by chat agents.
         Severity options: informational, low, medium, high, critical, all (default: all)"""
         earliest = _normalize_earliest(earliest)
         query = f"search `get_notable_index` earliest={earliest} {_ES_NOTABLE_ENRICHMENT}"
@@ -135,7 +236,9 @@ def register_splunk_tools(mcp):
                     "count": 0,
                 },
             )
-            return _handle_response(resp)
+            data = _handle_response(resp)
+            data = _resolve_notable_response(data)
+            return data if full else _slim_notable_response(data)
 
     @mcp.tool()
     async def splunk_list_indexes() -> dict:
